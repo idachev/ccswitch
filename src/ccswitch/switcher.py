@@ -25,6 +25,7 @@ from ccswitch.jsonio import read_json, write_json_atomic
 from ccswitch.keychain import read as keychain_read
 from ccswitch.keychain import write as keychain_write
 from ccswitch.keychain import delete as keychain_delete
+from ccswitch.keychain import KeychainError
 from ccswitch.oauth import (
     extract_oauth_data,
     is_oauth_token_expired,
@@ -477,6 +478,45 @@ class Switcher:
         self._console.print("Allow ~30 seconds before continuing idle sessions. In-flight requests keep their old login. "
                             "This verifies stored credentials, not the account used by each running session. "
                             "Environment tokens, API keys and some integrations may require /login or restart.")
+
+    @serialized
+    def rename(self, label: str, new_label: str) -> None:
+        """Copy saved credentials before committing the new metadata label."""
+        validate_label(new_label)
+        if self._store.get(label) is None:
+            raise ValueError(f"No saved account labeled {label!r}.")
+        if label == new_label:
+            self._console.print(f"Already named '{label}'.")
+            return
+        if new_label in self._store:
+            raise ValueError(f"An account labeled {new_label!r} already exists.")
+
+        credentials = {
+            CCSWITCH_KEYCHAIN_SERVICE: self._read_saved_blob(label),
+            SETUP_TOKEN_SERVICE: keychain_read(SETUP_TOKEN_SERVICE, label),
+        }
+        # Matching orphan copies allow a retry after interruption. Never overwrite
+        # unrelated credentials, including a setup-token absent from the source.
+        for service, value in credentials.items():
+            existing = keychain_read(service, new_label)
+            if existing is not None and existing != value:
+                raise ValueError(f"Keychain service {service!r} already contains a different entry for {new_label!r}.")
+        for service, value in credentials.items():
+            if value is not None:
+                keychain_write(service, new_label, value)
+        # Until this atomic write succeeds, the original profile stays usable.
+        # Failed copies can be retried with the same names.
+        self._store.rename(label, new_label)
+        self._console.print(f"[green]Renamed[/green] '{label}' to '{new_label}'.")
+        for service, value in credentials.items():
+            if value is not None:
+                try:
+                    keychain_delete(service, label)
+                except (KeychainError, OSError):
+                    self._console.print(
+                        f"[yellow]Warning:[/yellow] Rename completed, but the old entry for '{label}' "
+                        f"in Keychain service '{service}' remains. Remove that old entry in Keychain Access."
+                    )
 
     @serialized
     def remove(self, label: str) -> None:

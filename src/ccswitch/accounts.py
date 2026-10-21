@@ -21,7 +21,7 @@ under service ``ccswitch``, account ``<label>`` — never in this file.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -147,3 +147,22 @@ class AccountStore:
         del self._accounts[label]
         self._save()
         return True
+
+    def rename(self, label: str, new_label: str) -> None:
+        """Persist a label change in one atomic metadata write."""
+        validate_label(new_label)
+        account = self.get(label)
+        if account is None:
+            raise ValueError(f"No saved account labeled {label!r}.")
+        if label == new_label:
+            return
+        if new_label in self:
+            raise ValueError(f"An account labeled {new_label!r} already exists.")
+        original = self._accounts.copy()
+        del self._accounts[label]
+        self._accounts[new_label] = replace(account, label=new_label)
+        try:
+            self._save()
+        except BaseException:
+            self._accounts = original
+            raise

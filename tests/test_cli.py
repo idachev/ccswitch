@@ -44,6 +44,9 @@ def fake_switcher(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def remove(self, label: str) -> None:
             calls["calls"].append(("remove", {"label": label}))
 
+        def rename(self, label: str, new_label: str) -> None:
+            calls["calls"].append(("rename", {"label": label, "new_label": new_label}))
+
     monkeypatch.setattr(cli_mod, "Switcher", FakeSwitcher)
     return calls
 
@@ -68,8 +71,20 @@ def fake_run_with_account(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 def test_help_shows_all_subcommands() -> None:
     result = runner.invoke(cli_mod.app, ["--help"])
     assert result.exit_code == 0
-    for name in ("add", "add-token", "list", "current", "use", "recover", "remove", "exec"):
+    for name in ("add", "add-token", "list", "current", "use", "recover", "remove", "rename", "exec"):
         assert name in result.stdout
+
+
+def test_rename_passes_both_labels(fake_switcher):
+    result = runner.invoke(cli_mod.app, ["rename", "work", "company"])
+    assert result.exit_code == 0
+    assert ("rename", {"label": "work", "new_label": "company"}) in fake_switcher["calls"]
+
+
+def test_rename_requires_new_label(fake_switcher):
+    result = runner.invoke(cli_mod.app, ["rename", "work"])
+    assert result.exit_code == 2
+    assert not fake_switcher["calls"]
 
 
 # ---- list / current / add / use / remove --------------------------------

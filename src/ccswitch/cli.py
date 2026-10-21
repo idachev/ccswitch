@@ -102,6 +102,15 @@ def remove_cmd(
     _run(Switcher().remove, label)
 
 
+@app.command("rename")
+def rename_cmd(
+    label: Annotated[str, typer.Argument(help="Current saved account label.")],
+    new_label: Annotated[str, typer.Argument(help="New saved account label.")],
+) -> None:
+    """Rename a saved account and its saved credentials."""
+    _run(Switcher().rename, label, new_label)
+
+
 @app.command(
     "exec",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},

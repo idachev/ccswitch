@@ -270,3 +270,108 @@ def test_setup_token_saved_separately(state):
     state.sw.add_token("a", "synthetic-setup-token")
     assert state.entries[mod.SETUP_TOKEN_SERVICE, "a"] == "synthetic-setup-token"
     assert active(state) == "a-live"
+
+
+@pytest.mark.parametrize("label", ["a", "b"])
+@pytest.mark.parametrize("with_token", [False, True])
+def test_rename_preserves_login_and_moves_saved_credentials(state, label, with_token):
+    original_config = state.config.read_bytes()
+    original_live = state.entries[state.live]
+    original_account = state.store.get(label)
+    original_saved = state.entries[state.saved(label)]
+    if with_token:
+        state.entries[mod.SETUP_TOKEN_SERVICE, label] = "setup-synthetic"
+    state.sw.rename(label, "renamed")
+    reloaded = AccountStore(state.store.path)
+    assert reloaded.get(label) is None
+    renamed = reloaded.get("renamed")
+    assert renamed.oauth_account == original_account.oauth_account
+    assert renamed.email == original_account.email
+    assert renamed.organization_name == original_account.organization_name
+    assert state.entries[state.saved("renamed")] == original_saved
+    assert state.saved(label) not in state.entries
+    assert (mod.SETUP_TOKEN_SERVICE, label) not in state.entries
+    assert state.entries.get((mod.SETUP_TOKEN_SERVICE, "renamed")) == (
+        "setup-synthetic" if with_token else None
+    )
+    assert state.config.read_bytes() == original_config
+    assert state.entries[state.live] == original_live
+    state.sw.use("renamed")
+
+
+@pytest.mark.parametrize("source,destination", [("missing", "new"), ("a", "b"), ("a", "bad name")])
+def test_rename_rejects_invalid_names_without_mutation(state, source, destination):
+    before = dict(state.entries)
+    metadata = state.store.path.read_bytes()
+    with pytest.raises(ValueError):
+        state.sw.rename(source, destination)
+    assert state.entries == before
+    assert state.store.path.read_bytes() == metadata
+
+
+def test_rename_same_label_does_not_access_keychain(state, monkeypatch):
+    monkeypatch.setattr(mod, "keychain_read", lambda *args: pytest.fail("Unexpected Keychain access"))
+    state.sw.rename("a", "a")
+    assert "Already named" in state.output.getvalue()
+
+
+@pytest.mark.parametrize("service", [mod.CCSWITCH_KEYCHAIN_SERVICE, mod.SETUP_TOKEN_SERVICE])
+def test_rename_does_not_overwrite_orphan_destination(state, service):
+    state.entries[service, "new"] = "unrelated-secret"
+    before = dict(state.entries)
+    with pytest.raises(ValueError, match="different entry"):
+        state.sw.rename("a", "new")
+    assert state.entries == before
+    assert state.store.get("a") is not None
+
+
+@pytest.mark.parametrize("failure", ["copy", "metadata"])
+def test_rename_failure_keeps_original_usable_and_allows_retry(state, monkeypatch, failure):
+    state.entries[mod.SETUP_TOKEN_SERVICE, "a"] = "setup-synthetic"
+    original_entries = dict(state.entries)
+    original_metadata = state.store.path.read_bytes()
+    with monkeypatch.context() as patch:
+        if failure == "copy":
+            write = mod.keychain_write
+            def fail(service, account, value):
+                if service == mod.SETUP_TOKEN_SERVICE:
+                    raise KeychainError("denied")
+                write(service, account, value)
+            patch.setattr(mod, "keychain_write", fail)
+        else:
+            def fail():
+                raise OSError("disk full")
+            patch.setattr(state.store, "_save", fail)
+        with pytest.raises((KeychainError, OSError)):
+            state.sw.rename("a", "new")
+    assert state.store.path.read_bytes() == original_metadata
+    assert state.store.get("a") is not None
+    assert state.store.get("new") is None
+    for key, value in original_entries.items():
+        assert state.entries[key] == value
+    state.sw.rename("a", "new")
+    assert state.store.get("new") is not None
+    assert state.saved("a") not in state.entries
+
+
+def test_rename_missing_saved_login_leaves_metadata_unchanged(state):
+    del state.entries[state.saved("a")]
+    with pytest.raises(ValueError, match="missing"):
+        state.sw.rename("a", "new")
+    assert state.store.get("a") is not None
+    assert state.store.get("new") is None
+
+
+def test_rename_cleanup_failure_reports_completed_rename(state, monkeypatch):
+    state.entries[mod.SETUP_TOKEN_SERVICE, "a"] = "setup-synthetic"
+    delete = mod.keychain_delete
+    def fail(service, label):
+        if service == mod.CCSWITCH_KEYCHAIN_SERVICE:
+            raise KeychainError("denied")
+        delete(service, label)
+    monkeypatch.setattr(mod, "keychain_delete", fail)
+    state.sw.rename("a", "new")
+    assert AccountStore(state.store.path).get("new") is not None
+    assert state.entries[state.saved("new")] == state.entries[state.saved("a")]
+    assert (mod.SETUP_TOKEN_SERVICE, "a") not in state.entries
+    assert "Rename completed" in state.output.getvalue()

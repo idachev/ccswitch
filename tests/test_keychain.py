@@ -39,6 +39,26 @@ def test_read_not_found_returns_none(backend):
     assert backend.read("service", "account") is None
 
 
+@pytest.mark.parametrize("operation", ["write", "delete"])
+def test_mutation_finds_item_without_requesting_secret(backend, operation):
+    def find(_, slen, service, alen, account, length_ptr, data_ptr, item_ptr):
+        assert service == b"service" and account == b"account"
+        assert length_ptr is None
+        assert data_ptr is None
+        ct.cast(item_ptr, ct.POINTER(ct.c_void_p))[0] = ct.c_void_p(123)
+        return 0
+
+    backend.lib.SecKeychainFindGenericPassword = find
+    if operation == "write":
+        backend.write("service", "account", "new-synthetic")
+        backend.lib.SecKeychainItemModifyAttributesAndData.assert_called_once()
+    else:
+        backend.delete("service", "account")
+        backend.lib.SecKeychainItemDelete.assert_called_once()
+    backend.lib.SecKeychainItemFreeContent.assert_not_called()
+    backend.cf.CFRelease.assert_called_once()
+
+
 def test_read_error_contains_only_operation_and_status(backend):
     backend.lib.SecKeychainFindGenericPassword = Mock(return_value=-25293)
     with pytest.raises(mod.KeychainError, match="OSStatus -25293"):

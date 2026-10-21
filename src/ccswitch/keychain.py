@@ -40,15 +40,19 @@ class SecurityFramework:
         if status:
             raise KeychainError(f"Keychain {operation} failed (OSStatus {status}).")
 
-    def find(self, service, account):
+    def find(self, service, account, *, read_value=True):
         svc, acc = service.encode(), account.encode()
         length, data, item = ct.c_uint32(), ct.c_void_p(), ct.c_void_p()
         status = self.lib.SecKeychainFindGenericPassword(
-            None, len(svc), svc, len(acc), acc, ct.byref(length), ct.byref(data), ct.byref(item)
+            None, len(svc), svc, len(acc), acc,
+            ct.byref(length) if read_value else None,
+            ct.byref(data) if read_value else None, ct.byref(item)
         )
         if status == self.NOT_FOUND:
             return None, item
         self.check(status, "read")
+        if not read_value:
+            return None, item
         try:
             value = ct.string_at(data, length.value).decode("utf-8")
         except Exception:
@@ -68,7 +72,8 @@ class SecurityFramework:
     def write(self, service, account, value):
         data = value.encode()
         for _ in range(2):
-            _, item = self.find(service, account)
+            # Updating an item does not require reading its secret first.
+            _, item = self.find(service, account, read_value=False)
             if item:
                 try:
                     self.check(self.lib.SecKeychainItemModifyAttributesAndData(item, None, len(data), data), "write")
@@ -83,7 +88,7 @@ class SecurityFramework:
         raise KeychainError("Keychain entry changed concurrently; retry.")
 
     def delete(self, service, account):
-        _, item = self.find(service, account)
+        _, item = self.find(service, account, read_value=False)
         if item:
             try:
                 self.check(self.lib.SecKeychainItemDelete(item), "delete")

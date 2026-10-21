@@ -38,6 +38,17 @@ ccswitch add --label work
 ccswitch use personal --wait
 ```
 
+Rename a saved account with `ccswitch rename work company`. This moves its saved
+browser login and optional setup-token to the new label. The active Claude login
+and sessions stay unchanged. Existing account labels cannot be overwritten.
+Labels use letters, digits, `.`, `_`, or `-`, start with a letter or digit, and
+contain at most 64 characters.
+
+Credentials are copied before the metadata label is committed. If copying or
+metadata persistence fails, the old label stays usable; retry the same rename.
+An interruption can leave extra Keychain copies. If old-entry cleanup fails after
+the rename, the command reports the old entry to remove in Keychain Access.
+
 Save A immediately before signing into B, so its saved refresh token is current.
 Avoid `/logout` between enrollment and switching: revocation can invalidate a
 saved token. If the provider rejects an old login, use `/login` and save it again.
