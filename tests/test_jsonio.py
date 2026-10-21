@@ -78,3 +78,22 @@ def test_write_json_atomic_overwrites_existing(tmp_path: Path) -> None:
     os.chmod(p, 0o600)
     write_json_atomic(p, {"new": True})
     assert json.loads(p.read_text()) == {"new": True}
+
+
+def test_temp_file_is_private_before_replace(tmp_path, monkeypatch):
+    original = jsonio.os.replace
+    def replace(source, target):
+        assert stat.S_IMODE(source.stat().st_mode) == 0o600
+        original(source, target)
+    monkeypatch.setattr(jsonio.os, "replace", replace)
+    write_json_atomic(tmp_path / "private.json", {"data": "synthetic"})
+
+
+def test_symlinked_config_is_updated_without_replacing_link(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text('{}')
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    write_json_atomic(link, {"updated": True})
+    assert link.is_symlink()
+    assert json.loads(target.read_text()) == {"updated": True}

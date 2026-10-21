@@ -1,10 +1,8 @@
 """Typer command-line surface for ccswitch.
 
-Every subcommand wraps its underlying call so that the three expected
-"user error" exception types — ``ValueError``, :class:`KeychainError`,
-and ``FileNotFoundError`` — surface as a red one-line ``Error:`` message
-plus exit code 1. Unanticipated exceptions still bubble up so the user
-sees the traceback rather than a silent failure.
+Expected validation, filesystem, locking, and Keychain failures produce an
+Error message and exit code 1. Unexpected exceptions omit local variable values
+from tracebacks to avoid exposing credentials.
 """
 
 from __future__ import annotations
@@ -16,6 +14,7 @@ from rich.console import Console
 
 from ccswitch.exec_runner import run_with_account
 from ccswitch.keychain import KeychainError
+from ccswitch.locking import LockError
 from ccswitch.switcher import Switcher
 
 app = typer.Typer(
@@ -23,9 +22,10 @@ app = typer.Typer(
     help="macOS account switcher for Claude Code.",
     no_args_is_help=True,
     rich_markup_mode="rich",
+    pretty_exceptions_show_locals=False,
 )
 
-_HANDLED_ERRORS = (ValueError, KeychainError, FileNotFoundError)
+_HANDLED_ERRORS = (ValueError, KeychainError, LockError, OSError)
 
 
 def _run(fn, *args, **kwargs) -> None:
@@ -57,17 +57,9 @@ def add_token_cmd(
     label: Annotated[
         str, typer.Argument(help="Saved account label to attach the setup-token to.")
     ],
-    token: Annotated[
-        str | None,
-        typer.Option(
-            "--token",
-            "-t",
-            help="The `claude setup-token` value. Prompted for (hidden) if omitted.",
-        ),
-    ] = None,
 ) -> None:
     """Attach a long-lived `claude setup-token` to a saved account for `exec`."""
-    _run(Switcher().add_token, label, token=token)
+    _run(Switcher().add_token, label)
 
 
 @app.command("list")
@@ -85,9 +77,21 @@ def current_cmd() -> None:
 @app.command("use")
 def use_cmd(
     label: Annotated[str, typer.Argument(help="Saved account label to switch to.")],
+    wait: Annotated[bool, typer.Option("--wait", help="Wait 30s for normal credential cache expiry.")] = False,
 ) -> None:
     """Switch the global Claude Code account to the given label."""
-    _run(Switcher().use, label)
+    if wait:
+        _run(Switcher().use, label, wait=True)
+    else:
+        _run(Switcher().use, label)
+
+
+@app.command("recover")
+def recover_cmd(
+    keep_current: Annotated[bool, typer.Option("--keep-current", help="Keep a login repaired manually with /login.")] = False,
+) -> None:
+    """Recover a switch interrupted between Keychain and config writes."""
+    _run(Switcher().recover, keep_current=keep_current)
 
 
 @app.command("remove")

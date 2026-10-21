@@ -113,7 +113,7 @@ def _patch_urlopen(
             raise exc
         return _FakeResponse(payload or {})
 
-    monkeypatch.setattr(oauth_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(oauth_mod.urllib.request, "build_opener", lambda *args: type("Opener", (), {"open": staticmethod(fake_urlopen)})())
     return captured
 
 
@@ -206,7 +206,7 @@ def test_refresh_returns_none_when_response_not_json(monkeypatch: pytest.MonkeyP
     def fake_urlopen(req: Any, timeout: float | None = None) -> Any:
         return GarbageResponse()
 
-    monkeypatch.setattr(oauth_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(oauth_mod.urllib.request, "build_opener", lambda *args: type("Opener", (), {"open": staticmethod(fake_urlopen)})())
     assert refresh_oauth_credentials(_blob()) is None
 
 
@@ -217,3 +217,16 @@ def test_refresh_returns_none_when_blob_has_no_refresh_token() -> None:
 
 def test_refresh_returns_none_when_blob_is_garbage() -> None:
     assert refresh_oauth_credentials("{not json") is None
+
+
+def test_refresh_redirect_is_not_followed():
+    handler = oauth_mod._NoRedirect()
+    assert handler.redirect_request(None, None, 307, '', {}, 'https://other.invalid') is None
+
+
+@pytest.mark.parametrize('expiry', [True, float('nan'), float('inf'), 0, -1, None])
+def test_saved_login_rejects_invalid_expiry(expiry):
+    value = json.dumps({'claudeAiOauth': {'accessToken': 'synthetic', 'refreshToken': 'synthetic',
+                                        'expiresAt': expiry, 'scopes': ['user:inference']}})
+    with pytest.raises(ValueError):
+        oauth_mod.login_blob(value)

@@ -2,13 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
   pull_request:
 
 jobs:
   check:
-    # ccswitch targets macOS (it shells out to /usr/bin/security), but every test
-    # stubs subprocess, so the suite is platform-independent and runs here.
+    # Native Security.framework calls are mocked; filesystem concurrency uses
+    # real child processes. The suite runs without access to real credentials.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -17,7 +17,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync
+      - run: uv sync --frozen
 
       - run: uv run ruff check src tests
 

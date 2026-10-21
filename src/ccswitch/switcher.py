@@ -1,16 +1,14 @@
-"""Orchestration for ``add``, ``list``, ``current``, ``use``, and ``remove``.
-
-The :class:`Switcher` composes the lower-level modules (paths, jsonio,
-keychain, accounts) and owns the read-before-write discipline that makes
-the ``use`` operation safe: every read happens before any write, so an
-unreadable credential blob or malformed ``~/.claude.json`` aborts the
-switch with both the live config and the live Keychain entry untouched.
-"""
+"""Saved-login switching with refresh coordination, narrow writes, and recovery."""
 
 from __future__ import annotations
 
 import json
 import os
+import hashlib
+import time
+import pwd
+import re
+from functools import wraps
 from typing import Any
 
 from rich.console import Console
@@ -31,17 +29,52 @@ from ccswitch.oauth import (
     extract_oauth_data,
     is_oauth_token_expired,
     refresh_oauth_credentials,
+    login_blob,
 )
-from ccswitch.paths import get_claude_config_path
+from ccswitch.paths import get_claude_config_path, get_credentials_service
+from ccswitch.locking import DirectoryLock, refresh_locks, storage_and_config_locks
 
 CLAUDE_CREDENTIALS_SERVICE = "Claude Code-credentials"
 CCSWITCH_KEYCHAIN_SERVICE = "ccswitch"
 SETUP_TOKEN_SERVICE = "ccswitch-token"
 KEYCHAIN_CACHE_WARNING_SECONDS = 30
+RECOVERY_SERVICE = "ccswitch-recovery"
+
+
+def serialized(method):
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        if self._operation_depth:
+            return method(self, *args, **kwargs)
+        with DirectoryLock(self._store.path.with_suffix(".lock")):
+            self._store.reload()
+            self._operation_depth += 1
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._operation_depth -= 1
+    return run
+
+
+def require_stored_login():
+    overrides = [name for name in (
+        "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_PROFILE",
+        "ANTHROPIC_FEDERATION_RULE_ID", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE", "USE_STAGING_OAUTH", "USE_LOCAL_OAUTH",
+    ) if os.environ.get(name)]
+    if overrides:
+        raise ValueError("Stored-login switching conflicts with: " + ", ".join(overrides) + ". Unset these first.")
+    get_credentials_service()  # Validate path spelling before any mutation.
+    get_claude_config_path()
 
 
 def _current_user() -> str:
-    return os.environ.get("USER", "user")
+    try:
+        name = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return "claude-code-user"
+    return name if re.fullmatch(r"[a-zA-Z0-9._-]+", name) else "claude-code-user"
 
 
 def _active_identity(claude_config: dict[str, Any] | None) -> tuple[str, str] | None:
@@ -78,6 +111,16 @@ class Switcher:
         self._store = store if store is not None else AccountStore()
         self._console = console if console is not None else Console()
         self._user = _current_user()
+        self._operation_depth = 0
+
+    @property
+    def _service(self):
+        return get_credentials_service()
+
+    @property
+    def _recovery_key(self):
+        identity = f"{self._service}|{self._user}|{get_claude_config_path().resolve()}"
+        return hashlib.sha256(identity.encode()).hexdigest()
 
     # ---- Prompts (extracted so tests can monkey-patch on the instance) ----
 
@@ -112,14 +155,16 @@ class Switcher:
                 f"Claude config not found at {path}. Run Claude Code at least "
                 f"once to sign in before using ccswitch."
             )
+        if not isinstance(data, dict):
+            raise ValueError("Claude config must be a JSON object.")
         return data
 
     def _read_active_credentials_blob(self) -> str:
-        blob = keychain_read(CLAUDE_CREDENTIALS_SERVICE, self._user)
+        blob = keychain_read(self._service, self._user)
         if not blob:
             raise ValueError(
                 f"No active Claude Code credentials found in Keychain "
-                f"(service={CLAUDE_CREDENTIALS_SERVICE!r}, account={self._user!r}). "
+                f"(service={self._service!r}, account={self._user!r}). "
                 f"Sign in via Claude Code first."
             )
         return blob
@@ -142,21 +187,17 @@ class Switcher:
     def _refresh_if_expired(self, label: str, blob: str) -> str:
         """Refresh the access token in ``blob`` when expired; persist back to Keychain.
 
-        Best-effort: on refresh failure, returns the original blob with a
-        warning. Claude Code will surface its own 401 in that case.
+        On refresh failure, abort before touching the active login.
         """
         oauth = extract_oauth_data(blob)
         if not oauth or not is_oauth_token_expired(oauth.get("expiresAt")):
             return blob
         refreshed = refresh_oauth_credentials(blob)
         if refreshed is None:
-            self._console.print(
-                "[yellow]Warning:[/yellow] saved access token is expired and refresh "
-                f"failed (refresh token may have been revoked by a Claude Code /logout). "
-                f"If `claude` reports 401 errors, re-login to the '{label}' account in "
-                f"Claude Code and run `ccswitch add --label {label}` to repair."
-            )
-            return blob
+            raise ValueError(f"Refresh failed for '{label}'; active login unchanged. Run /login and add it again.")
+        refreshed = login_blob(refreshed)
+        if is_oauth_token_expired(extract_oauth_data(refreshed)["expiresAt"]):
+            raise ValueError("Refresh returned an unusable expiry; active login unchanged.")
         # Persist refreshed credentials so the next switch/exec doesn't re-refresh.
         keychain_write(CCSWITCH_KEYCHAIN_SERVICE, label, refreshed)
         return refreshed
@@ -176,16 +217,17 @@ class Switcher:
 
     # ---- Public commands ---------------------------------------------------
 
+    @serialized
     def add(self, label_override: str | None = None) -> None:
         """Save the currently-active Claude Code account."""
+        require_stored_login()
         config = self._read_claude_config()
         oauth = config.get("oauthAccount")
-        if not isinstance(oauth, dict):
+        if not isinstance(oauth, dict) or _active_identity(config) is None:
             raise ValueError(
                 "Active Claude Code config has no oauthAccount section. "
                 "Sign in via Claude Code first."
             )
-        blob = self._read_active_credentials_blob()
 
         email = str(oauth.get("emailAddress", ""))
         org_name = str(oauth.get("organizationName", ""))
@@ -213,16 +255,18 @@ class Switcher:
                     f"Pick a different label or remove the existing one first."
                 )
 
-        account = Account(
-            label=label,
-            email=email,
-            organization_name=org_name,
-            oauth_account=oauth,
-        )
-        keychain_write(CCSWITCH_KEYCHAIN_SERVICE, label, blob)
-        self._store.add(account)
+        with refresh_locks() as check_refresh, storage_and_config_locks() as check_storage:
+            self._require_no_recovery()
+            current = self._read_claude_config()
+            if _active_identity(current) != _active_identity(config):
+                raise ValueError("Active account changed during the prompt; retry.")
+            blob = login_blob(self._read_active_credentials_blob())
+            check_refresh()
+            check_storage()
+            self._save_login(label, current["oauthAccount"], blob)
         self._console.print(f"[green]Saved[/green] account '{label}' ({email}).")
 
+    @serialized
     def add_token(self, label: str, token: str | None = None) -> None:
         """Attach a long-lived ``claude setup-token`` to an already-saved account.
 
@@ -297,80 +341,144 @@ class Switcher:
                 f"({email} · {org_name})"
             )
 
-    def use(self, label: str) -> None:
-        """Switch the global Claude Code config + Keychain entry to ``label``."""
+    def _save_login(self, label, account, blob):
+        keychain_write(CCSWITCH_KEYCHAIN_SERVICE, label, login_blob(blob))
+        self._store.add(Account(label, account["emailAddress"], account.get("organizationName", ""), account))
+
+    def _require_no_recovery(self):
+        if keychain_read(RECOVERY_SERVICE, self._recovery_key):
+            raise ValueError("An interrupted switch needs recovery. Run `ccswitch recover` first.")
+
+    def _restore(self, journal, check):
+        """Conditional rollback, preserving every field unrelated to the login."""
+        current = json.loads(self._read_active_credentials_blob())
+        config = self._read_claude_config()
+        if (current.get("claudeAiOauth") not in (journal["oldLogin"], journal["newLogin"])
+                or config.get("oauthAccount") not in (journal["oldAccount"], journal["newAccount"])):
+            raise ValueError("Login changed after the interrupted switch; refusing to overwrite it. "
+                             "Run /login to establish the desired account, then `ccswitch recover --keep-current`.")
+        current["claudeAiOauth"] = journal["oldLogin"]
+        check()
+        keychain_write(self._service, self._user, json.dumps(current))
+        config["oauthAccount"] = journal["oldAccount"]
+        check()
+        write_json_atomic(get_claude_config_path(), config)
+
+    @serialized
+    def recover(self, keep_current: bool = False):
+        """Restore an interrupted transaction, or explicitly keep a repaired login."""
+        require_stored_login()
+        with refresh_locks() as check_refresh, storage_and_config_locks() as check_storage:
+            saved = keychain_read(RECOVERY_SERVICE, self._recovery_key)
+            if not saved:
+                self._console.print("No interrupted switch to recover.")
+                return
+            if keep_current:
+                # This is an explicit acknowledgement after manual /login. Do not guess identity from a token.
+                login_blob(self._read_active_credentials_blob())
+                if not _active_identity(self._read_claude_config()):
+                    raise ValueError("Current account metadata is missing; complete /login first.")
+            else:
+                check_refresh()
+                check_storage()
+                self._restore(json.loads(saved), lambda: (check_refresh(), check_storage()))
+            check_refresh()
+            check_storage()
+            keychain_delete(RECOVERY_SERVICE, self._recovery_key)
+        self._console.print("Recovery complete. Run `ccswitch add` to update any profile repaired with /login.")
+
+    @serialized
+    def use(self, label: str, wait: bool = False) -> None:
+        """Switch the stored login. Live adoption depends on each process's credential source."""
+        require_stored_login()
         target = self._store.get(label)
         if target is None:
-            raise ValueError(
-                f"No saved account labeled {label!r}. Run `ccswitch list` to see saved labels."
-            )
-
-        # ---- READ phase (everything before any mutation) ----
-        saved_blob = self._read_saved_blob(label)
+            raise ValueError(f"No saved account labeled {label!r}.")
         config = self._read_claude_config()
-        saved_blob = self._refresh_if_expired(label, saved_blob)
-        # The live Keychain entry holds the currently-active account's freshest
-        # (possibly just-rotated) credentials. Read it now so we can preserve it
-        # before the write phase overwrites it. Tolerate absence — older configs
-        # or a missing entry simply mean there is nothing to preserve.
-        live_blob = keychain_read(CLAUDE_CREDENTIALS_SERVICE, self._user)
-
-        # Identify the currently-active account against the saved set.
-        active_identity = _active_identity(config)
-        active_label = None
-        if active_identity is not None:
-            active_label = next(
-                (
-                    acc.label
-                    for acc in self._store.list()
-                    if _account_identity(acc) == active_identity
-                ),
-                None,
-            )
-
-        if active_identity is not None and active_label is None:
-            # R18: the active account is not saved — offer to save it first so
-            # its credentials aren't lost when we overwrite the live entry.
-            oauth = config.get("oauthAccount", {})
-            email = str(oauth.get("emailAddress", ""))
-            org_name = str(oauth.get("organizationName", ""))
-            suggested = suggest_label(email, org_name)
-            if self._confirm(
-                f"The currently-active account ({email}) is not saved. "
-                f"Save it as '{suggested}' before switching?",
-                default=True,
-            ):
-                self.add(label_override=suggested)
-            else:
-                self._console.print(
-                    "[yellow]Aborted.[/yellow] Use `ccswitch add --label <name>` "
-                    "to save it manually."
-                )
+        self._require_no_recovery()
+        identity = _active_identity(config)
+        if identity is None or _account_identity(target) is None:
+            raise ValueError("Missing account identity; complete /login and add the account again.")
+        active = next((a for a in self._store.list() if _account_identity(a) == identity), None)
+        # Never wait for human input while holding Claude's locks.
+        if active is None:
+            oauth = config["oauthAccount"]
+            suggested = suggest_label(oauth["emailAddress"], oauth.get("organizationName", ""))
+            if not self._confirm(f"Save the current account as '{suggested}' before switching?", default=True):
+                self._console.print("Aborted; active login unchanged.")
                 return
+            self.add(label_override=suggested)
+            active = self._store.get(suggested)
 
-        # ---- WRITE phase ----
-        # Re-capture the active account's live (rotated) credentials into its
-        # saved entry before we overwrite the live entry. Without this, its saved
-        # copy keeps a refresh token the live app already rotated out, so a later
-        # `use` of that account fails to refresh. Skipped when switching to the
-        # already-active account (it would only clobber its own saved copy).
-        if active_label is not None and active_label != label and live_blob:
-            keychain_write(CCSWITCH_KEYCHAIN_SERVICE, active_label, live_blob)
+        with refresh_locks() as check_refresh:
+            with storage_and_config_locks() as check_storage:
+                self._require_no_recovery()
+                config = self._read_claude_config()
+                if _active_identity(config) != identity:
+                    raise ValueError("Active account changed; retry.")
+                live_blob = self._read_active_credentials_blob()
+                old_login = json.loads(login_blob(live_blob))["claudeAiOauth"]
+                check_refresh()
+                check_storage()
+                self._save_login(active.label, config["oauthAccount"], live_blob)
+                if _account_identity(target) == identity:
+                    # Never restore an older snapshot over the currently active account.
+                    if target.label != active.label:
+                        self._save_login(target.label, config["oauthAccount"], live_blob)
+                    self._console.print(f"Already using '{label}'; saved the current login without replacing it.")
+                    return
+            saved_blob = login_blob(self._read_saved_blob(label))
+            # Only the refresh locks are held during HTTP; MCP and config writers may proceed.
+            saved_blob = self._refresh_if_expired(label, saved_blob)
+            # Migrate legacy full-store snapshots to login-only profiles, even without a refresh.
+            keychain_write(CCSWITCH_KEYCHAIN_SERVICE, label, saved_blob)
+            new_login = json.loads(saved_blob)["claudeAiOauth"]
+            with storage_and_config_locks() as check_storage:
+                check_refresh()
+                check_storage()
+                config = self._read_claude_config()
+                live = json.loads(self._read_active_credentials_blob())
+                if _active_identity(config) != identity or live.get("claudeAiOauth") != old_login:
+                    raise ValueError("Active login changed during preparation; no switch applied. Retry.")
+                # Re-read under the locks: retain concurrent MCP/plugin and unrelated config changes.
+                journal = {"oldLogin": old_login, "newLogin": new_login,
+                           "oldAccount": config["oauthAccount"], "newAccount": target.oauth_account}
+                keychain_write(RECOVERY_SERVICE, self._recovery_key, json.dumps(journal))
+                try:
+                    check_refresh()
+                    check_storage()
+                    live["claudeAiOauth"] = new_login
+                    keychain_write(self._service, self._user, json.dumps(live))
+                    check_refresh()
+                    check_storage()
+                    config["oauthAccount"] = target.oauth_account
+                    write_json_atomic(get_claude_config_path(), config)
+                    check_refresh()
+                    check_storage()
+                    verified = json.loads(self._read_active_credentials_blob())
+                    if (verified.get("claudeAiOauth") != new_login
+                            or self._read_claude_config().get("oauthAccount") != target.oauth_account):
+                        raise ValueError("Stored login verification failed.")
+                except BaseException:
+                    try:
+                        check_refresh()
+                        check_storage()
+                        self._restore(journal, lambda: (check_refresh(), check_storage()))
+                        keychain_delete(RECOVERY_SERVICE, self._recovery_key)
+                    except Exception:
+                        raise ValueError("Switch interrupted and rollback could not finish. "
+                                         "Recovery data remains in Keychain; run `ccswitch recover`.") from None
+                    raise
+                keychain_delete(RECOVERY_SERVICE, self._recovery_key)
+        self._console.print(f"Stored login switched to '{label}' ({target.email}).")
+        if wait:
+            self._console.print("Waiting 30 seconds for normal credential cache expiry; no sessions are restarted.")
+            time.sleep(KEYCHAIN_CACHE_WARNING_SECONDS)
+        self._console.print("Allow ~30 seconds before continuing idle sessions. In-flight requests keep their old login. "
+                            "This verifies stored credentials, not the account used by each running session. "
+                            "Environment tokens, API keys and some integrations may require /login or restart.")
 
-        new_config = dict(config)
-        new_config["oauthAccount"] = target.oauth_account
-        write_json_atomic(get_claude_config_path(), new_config)
-        keychain_write(CLAUDE_CREDENTIALS_SERVICE, self._user, saved_blob)
-
-        self._console.print(
-            f"[green]Switched[/green] to '{label}' ({target.email})."
-        )
-        self._console.print(
-            f"[dim]Note: macOS Keychain caches credentials for ~{KEYCHAIN_CACHE_WARNING_SECONDS} "
-            f"seconds. A running Claude Code session will not reflect the change until "
-            f"restart or cache expiry.[/dim]"
-        )
-
+    @serialized
     def remove(self, label: str) -> None:
         """Delete a saved account after interactive confirmation."""
         target = self._store.get(label)

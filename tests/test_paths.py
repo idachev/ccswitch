@@ -76,3 +76,43 @@ def test_ccswitch_config_dir_ignores_empty_xdg_config_home(
 
 def test_accounts_file_lives_inside_ccswitch_config_dir(tmp_home: Path) -> None:
     assert get_accounts_file() == tmp_home / ".config" / "ccswitch" / "accounts.json"
+
+
+def test_credentials_service_tracks_config_dir(tmp_home, monkeypatch):
+    import hashlib
+    from ccswitch.paths import get_credentials_service
+    value = str(tmp_home / "work")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
+    assert get_credentials_service() == "Claude Code-credentials-" + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def test_secure_storage_override_including_explicit_default(tmp_home, monkeypatch):
+    from ccswitch.paths import get_credentials_service, get_secure_storage_dir
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_home / "work"))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+    assert get_credentials_service() == "Claude Code-credentials"
+    assert get_secure_storage_dir() == tmp_home / ".claude"
+
+
+def test_relative_storage_path_refused(monkeypatch):
+    from ccswitch.paths import get_credentials_service
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative")
+    with pytest.raises(ValueError, match="absolute"):
+        get_credentials_service()
+
+
+def test_relative_config_refused_even_with_absolute_storage(tmp_home, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative")
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(tmp_home / "secure"))
+    with pytest.raises(ValueError, match="absolute"):
+        get_claude_config_path()
+
+
+def test_config_and_storage_use_nfc_paths(tmp_home, monkeypatch):
+    import unicodedata
+    from ccswitch.paths import get_secure_storage_dir
+    raw = str(tmp_home / "cafe\u0301")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", raw)
+    normalized = Path(unicodedata.normalize("NFC", raw))
+    assert get_secure_storage_dir() == normalized
+    assert get_claude_config_path() == normalized / ".claude.json"

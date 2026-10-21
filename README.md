@@ -1,195 +1,191 @@
-# ccswitch
+# ccswitch — safer OAuth switching fork
 
-A small macOS-only CLI for managing multiple Claude Code accounts. Switch the
-globally-active account, or scope a single command to a chosen account via
-environment variables, without going through Claude Code's browser login again.
+macOS CLI for switching Claude Code browser logins while retaining one config
+and session directory. Fork of [lfreeman/ccswitch](https://github.com/lfreeman/ccswitch).
+Requires macOS and Python 3.12+.
 
-The scope is deliberately narrow: macOS only, one user, one machine. There is
-no Linux or Windows support, no transactional rollback, no usage statistics,
-and no TUI.
+This fork coordinates credential writes, preserves unrelated secrets, and adds
+rollback/recovery. It does not log into accounts for you or restart sessions.
+Native lock paths and credential caching were inspected in Claude Code **2.1.306**.
+Adoption by two real, already-running account sessions still needs an end-to-end
+test. Claude Code updates can change these private implementation details.
 
-## Install
+## Install this fork
+
+The PyPI package is the upstream implementation, not this fork. From this checkout:
 
 ```bash
-uv tool install ccswitch
+uv tool install .
+ccswitch --help
 ```
 
-Requires Python 3.12+ and macOS.
+Review a pinned commit before installing updates. Installation does not enroll or
+switch any accounts.
 
-## What it does
+## Enroll two accounts with one ~/.claude
 
-`ccswitch` stores each saved account as:
+Use Claude Code's normal browser login, without an environment token or API key.
+Let running requests finish before enrollment or switching.
 
-- a Keychain entry under service `ccswitch`, account `<label>` — the full
-  credential blob (access token, refresh token, scopes)
-- a row in `~/.config/ccswitch/accounts.json` — non-secret metadata (email,
-  organization, the `oauthAccount` subtree from `~/.claude.json`)
+```bash
+# Sign into account A with /login inside Claude Code, then:
+ccswitch add --label personal
 
-Switching globally rewrites only the `oauthAccount` field inside
-`~/.claude.json` and overwrites the macOS Keychain entry under service
-`Claude Code-credentials`. Every other field in `~/.claude.json` — including
-the project history that grows over time — is preserved byte-for-byte.
+# Use /login inside Claude Code to sign into account B, then:
+ccswitch add --label work
+
+# Select the saved login and allow the normal credential cache to expire:
+ccswitch use personal --wait
+```
+
+Save A immediately before signing into B, so its saved refresh token is current.
+Avoid `/logout` between enrollment and switching: revocation can invalidate a
+saved token. If the provider rejects an old login, use `/login` and save it again.
+Do not copy the same browser-login refresh chain into another config directory
+or machine that can refresh it independently.
+
+For later changes:
+
+```bash
+ccswitch use work --wait
+ccswitch use personal --wait
+```
+
+The global switch replaces only `claudeAiOauth` in Claude's Keychain entry and
+`oauthAccount` in its config. MCP/plugin secrets, other config values, settings,
+project files, and session history remain in place. JSON formatting can change.
+All sessions using that same stored login are candidates for the change; this is
+not a way to keep different accounts active in different sessions simultaneously.
+
+Before switching away, ccswitch saves the latest active login. Selecting the
+already-active account only updates its saved copy; it never restores an older
+token over the live one. An expired target must refresh successfully before any
+live-login changes occur. Refresh failure aborts the switch.
+
+## Running sessions and the 30-second wait
+
+Claude Code 2.1.306 contains a 30-second credential cache and checks storage for
+changed credentials when creating an API client. An idle session using native
+Keychain credentials is therefore expected to adopt the new token on a later
+request after the cache expires. This is based on code inspection, not a completed
+two-account live-session test.
+
+`--wait` waits 30 seconds after the writes and after releasing Claude's locks.
+It does not signal a process, prove which account a request used, or migrate a
+request already in flight. It does not verify Remote Control or connector state.
+If a session keeps its old identity or fails authentication, use `/login` or
+restart it and resume its existing session.
+
+ccswitch rejects conflicting authentication variables in its own environment,
+including `CLAUDE_CODE_OAUTH_TOKEN`, API keys, custom API URLs, and cloud backends.
+It cannot inspect or change environments inherited by existing Claude processes.
+Settings such as `apiKeyHelper` can also select a different authentication source.
+`current` and `list` show stored account metadata, not a live server-side identity
+check for each running session.
 
 ## Commands
 
-### `ccswitch add [--label NAME]`
+| Command | Purpose |
+| --- | --- |
+| `ccswitch add --label NAME` | Save the current browser login; confirm before updating an existing matching label. |
+| `ccswitch list` | List saved labels and mark the stored active identity. |
+| `ccswitch current` | Show the identity stored in Claude's config. |
+| `ccswitch use NAME [--wait]` | Save the latest current login, then switch to NAME. |
+| `ccswitch recover` | Restore the old login after an interrupted switch, when its state still matches the journal. |
+| `ccswitch recover --keep-current` | Discard the recovery journal after manually repairing the login. |
+| `ccswitch remove NAME` | Confirm removal of a saved login and setup-token; keep live Claude state. |
+| `ccswitch add-token NAME` | Read a separate `claude setup-token` through a hidden prompt. |
+| `ccswitch exec NAME -- COMMAND...` | Run a disposable command with that separate setup-token. |
 
-Save the currently-active Claude Code account. If `--label` is omitted, you'll
-be prompted for one with a default of `<email-local>-<org-slug>` (e.g.,
-`user-example-org`).
+`add-token` has no `--token` option: tokens must not enter shell history or process
+arguments. The setup-token must belong to the intended account; ccswitch cannot
+infer its account identity locally.
 
-```bash
-ccswitch add                    # prompts for a label
-ccswitch add --label personal   # uses the given label directly
-```
+`exec` requires `add-token`. It never hands a browser-login refresh token to a
+child that could rotate it and discard the replacement. The child receives a
+temporary config directory, deleted on exit. Use `use` for shared session history;
+`exec` is a separate disposable workflow. A setup-token is passed through the
+child environment, so run only trusted commands.
 
-### `ccswitch add-token <label>`
+## Failure recovery
 
-Attach a long-lived `claude setup-token` to an account you have already saved,
-for use by `ccswitch exec`. The browser-login credentials captured by `add`
-share a refresh token that Claude Code rotates about once an hour, so a saved
-copy goes stale quickly (see [Token refresh](#token-refresh)). A setup-token
-lasts roughly a year and is not part of that rotating chain.
-
-```bash
-# 1. Sign in to the target account, then create a token (it prints to your terminal):
-claude setup-token
-# 2. Paste it into ccswitch (prompted for, with the input hidden, if --token is omitted):
-ccswitch add-token work
-```
-
-When a setup-token is present, `exec` uses it and leaves the rotating refresh
-chain alone.
-
-### `ccswitch list`
-
-Show all saved accounts with a marker on whichever one matches the currently-
-active `oauthAccount`.
-
-### `ccswitch current`
-
-Print the currently-active Claude account. If the active account isn't saved
-yet, the output names the email and suggests `ccswitch add`.
-
-### `ccswitch use <label>`
-
-Switch the global Claude Code account to the saved `<label>`. Only the
-`oauthAccount` subtree of `~/.claude.json` is rewritten; the Keychain entry
-under service `Claude Code-credentials` is replaced with the saved blob.
+A switch spans Keychain and a JSON file; these cannot be one atomic transaction.
+Before changing the live state, ccswitch stores an encrypted-by-Keychain recovery
+journal. A normal write failure triggers conditional rollback. A crash or failed
+rollback leaves the journal and blocks further switches or enrollment:
 
 ```bash
-ccswitch use work
+ccswitch recover
 ```
 
-If the currently-active account isn't yet saved, `use` will prompt you to save
-it first so you don't lose access to its credentials.
-
-> A running Claude Code session won't notice the switch right away: macOS
-> Keychain caches reads for about 30 seconds. Restart the Claude Code app (or
-> wait ~30s) for the change to take effect.
-
-### `ccswitch exec <label> -- <cmd...>`
-
-Run `<cmd>` once with environment variables scoped to `<label>`. Neither
-`~/.claude.json` nor the global Keychain entry is modified. This is useful for
-pipelines that invoke `claude` or `claude_agent_sdk` and need a specific
-account without disturbing the interactive session:
+Recovery preserves unrelated config and secrets. It refuses to overwrite a login
+that has changed since the failed transaction. In that case, establish the desired
+account with Claude Code's `/login`, then run:
 
 ```bash
-ccswitch exec work -- claude -p "say hello"
-ccswitch exec personal -- claude -p "say hello"
+ccswitch recover --keep-current
+ccswitch add --label personal
 ```
 
-Credentials come from one of two sources, in order:
+Use the label matching the account you actually logged into. Without a pending
+journal, ordinary expired/revoked-login recovery is `/login`, then `add` again.
+`/login` repairs authentication; it does not restore deleted settings or secrets.
 
-1. **A `claude setup-token` saved with `ccswitch add-token`.** It is injected
-   as `CLAUDE_CODE_OAUTH_TOKEN`. This is the reliable source for `exec`,
-   because the token is not part of the interactive login's rotating refresh
-   chain and keeps working while the same account is signed in to Claude Code.
-2. **The saved browser-login credentials**, used only when no setup-token
-   exists. They are injected as `CLAUDE_CODE_OAUTH_TOKEN`,
-   `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, and `CLAUDE_CODE_OAUTH_SCOPES`, and an
-   expired access token is refreshed first. If the access token has expired and
-   its refresh token has already been rotated out, `exec` stops with an error
-   that points to `add-token` rather than starting a command that would fail
-   with a 401.
+ccswitch serializes its own writers and acquires Claude's current and legacy OAuth
+refresh locks, storage-write lock, and config lock. It uses heartbeat directory
+locks and checks ownership before live writes. It can reclaim a lock left by its
+own dead process, but never deliberately removes a foreign lock. A contention
+timeout leaves the other process alone; retry after it finishes. An interrupted
+lock setup/cleanup or PID reuse can require manual inspection of a stuck lock.
 
-In both cases the child process also receives `CLAUDE_CONFIG_DIR`, a
-per-invocation temporary directory holding a minimal `.claude.json` with the
-target account's `oauthAccount`. That directory is deleted when the child exits.
+There is still an unavoidable failure window if a server rotates a refresh token
+and the response or subsequent Keychain persistence is lost. `/login` is the repair
+path. Process suspension can also outlive native stale-lock intervals. Locks and
+recovery reduce races; they cannot guarantee recovery from every system failure
+or an external program that ignores these locks.
 
-> **One caveat, and only for the browser-login source.** On that path the child
-> receives a refresh token. If a long-running `exec` outlives the access token
-> (about an hour), Claude Code refreshes the token itself. The refresh rotates
-> the refresh token server-side, but the new values are written into the
-> temporary `CLAUDE_CONFIG_DIR` that `exec` then deletes. ccswitch never sees
-> them, so both the saved copy and the live copy are left holding a refresh
-> token the server has already invalidated. `ccswitch add-token` avoids the
-> problem: a setup-token carries no refresh token and is never rotated.
+## Storage and credential handling
 
-### `ccswitch remove <label>`
+| Location | Contents |
+| --- | --- |
+| Claude config, normally `~/.claude.json` | Only `oauthAccount` is changed. |
+| `~/.config/ccswitch/accounts.json` | Labels and account metadata, mode `0600`; honors absolute `XDG_CONFIG_HOME`. |
+| Keychain service `ccswitch`, account label | Browser login only, without MCP/plugin secrets. |
+| Keychain service `ccswitch-token`, account label | Optional separate setup-token for `exec`. |
+| Keychain service `ccswitch-recovery` | Temporary login recovery journal, scoped to user, service, and config path. |
+| Keychain service `Claude Code-credentials`, OS account | Claude's live credentials; preserve every field except the selected login. |
 
-Delete a saved account after a `[y/N]` confirmation. The matching Keychain
-entry is removed; the row in `accounts.json` goes with it. Live Claude Code
-state (whatever's in `~/.claude.json` and the `Claude Code-credentials`
-Keychain entry) is left alone.
+Credentials are accessed with Security.framework directly, not `security -w`
+arguments. Keychain errors contain status codes rather than secret values. New
+JSON temporary files are private before content is written. Expected errors and
+CLI tracebacks do not display local variables.
 
-## Where things live
+Absolute `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` are supported.
+The Keychain service suffix follows Claude's SHA-256 naming scheme; an explicitly
+empty secure-storage override selects the default Keychain service. The legacy
+`<config-home>/.config.json` takes precedence when present. For a shared default
+`~/.claude`, leave both variables unset. Keep one ccswitch metadata directory;
+labels and saved Keychain entries are global to the macOS user.
 
-- `~/.claude.json` — Claude Code's own config (ccswitch only ever touches the
-  `oauthAccount` subtree)
-- `~/.config/ccswitch/accounts.json` — ccswitch's metadata, mode `0600`
-- macOS Keychain service `ccswitch`, account `<label>` — per-account credential
-  blobs
-- macOS Keychain service `Claude Code-credentials`, account `$USER` —
-  Claude Code's live credentials (only `use` writes here)
+Plaintext `.credentials.json` fallback is not supported. A missing or inaccessible
+Keychain entry fails closed. macOS may prompt to allow Python access to Keychain.
 
-`CLAUDE_CONFIG_DIR` is honored when set, and the legacy `<config_home>/.config.json`
-location takes precedence over `~/.claude.json` if it exists — same resolution
-order Claude Code itself uses.
+## Validation
 
-## Token refresh
+```bash
+uv sync --frozen
+uv run pytest -q
+uv run ruff check .
+```
 
-Claude Code access tokens expire after about an hour. `ccswitch use` and
-`ccswitch exec` refresh an expired saved token against the OAuth endpoint
-before handing it back to Claude Code. The refreshed token is also written
-back to the per-label Keychain entry, so the next switch does not have to
-refresh again.
+Tests use synthetic credentials and temporary config directories. They cover
+rotating-token round trips, selecting the same account, failed refresh, rollback,
+crash recovery, intervening config/secret updates, custom storage paths, secret-free
+CLI arguments, and real competing processes for directory locks. The native
+Keychain adapter was also checked on macOS with a unique synthetic entry through
+create/read/update/delete; no real Claude credentials were used for that check.
 
-Refresh tokens rotate. Each time an account refreshes, which most often happens
-inside the running Claude Code app, the server issues a new refresh token and
-invalidates the previous one. Saved browser-login credentials for an account
-you also use interactively can therefore have their stored refresh token
-invalidated within the hour, after which refresh fails. For `exec`, the durable
-fix is `ccswitch add-token`, which stores a setup-token outside the rotating
-chain. `ccswitch use` is not affected, because it writes the saved credentials
-into the live Keychain entry and leaves Claude Code as the sole owner of the
-chain.
-
-When refresh fails, `ccswitch use` continues with a warning and `ccswitch exec`
-stops with a recovery hint. To recover:
-
-1. Sign back in to the affected account with `/login` in Claude Code, avoiding
-   `/logout` first if you can.
-2. Run `ccswitch add --label <name>` again to capture fresh credentials.
-
-> **Avoid `/logout` once you have saved accounts.** Switch with
-> `ccswitch use <label>` instead. It only rewrites the Keychain entry locally,
-> so the previous account's refresh token stays valid.
-
-## Troubleshooting
-
-- **A `use` does not appear to take effect right away.** The macOS Keychain
-  caches reads for about 30 seconds. Restart the Claude Code app or wait for
-  the cache to expire.
-- **`ccswitch use` reports a missing Keychain entry.** The per-label entry
-  (service `ccswitch`, account `<label>`) was removed outside of ccswitch. Run
-  `ccswitch add` again with the same label to repair it.
-- **`Please run /login · API Error: 401` after a switch.** The saved refresh
-  token has been revoked, usually by an earlier `/logout`. See
-  [Token refresh](#token-refresh) for the recovery steps.
-- **`exec` reports expired credentials, or returns a 401.** The saved
-  browser-login refresh token was rotated out by the running Claude Code app
-  (see [Token refresh](#token-refresh)). Run `ccswitch add-token <label>` to
-  attach a `claude setup-token`, which is the reliable credential source for
-  `exec`.
+The remaining acceptance test is A → B → A with two actual accounts and existing
+idle Claude sessions, including another switch after a real token refresh. Check
+the provider's account usage for each request; the local `current` output alone
+cannot prove which account served it.

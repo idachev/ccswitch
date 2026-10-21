@@ -109,6 +109,9 @@ class AccountStore:
             )
         self._accounts = loaded
 
+    def reload(self) -> None:
+        self._load()
+
     def _save(self) -> None:
         payload = {
             "accounts": {

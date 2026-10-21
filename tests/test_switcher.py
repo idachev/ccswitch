@@ -1,791 +1,272 @@
-"""Tests for ccswitch.switcher.
-
-Reads and writes against the live Keychain are mocked by patching the
-``keychain_read`` / ``keychain_write`` / ``keychain_delete`` names that
-``switcher`` imported, so no test touches the real Keychain.
-"""
-
-from __future__ import annotations
-
+"""Regression coverage for live-login switching. No real Keychain or HTTP calls."""
+import io
 import json
-from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 
+from ccswitch import switcher as mod
 from ccswitch.accounts import Account, AccountStore
-from ccswitch import switcher as switcher_mod
 from ccswitch.keychain import KeychainError
-from ccswitch.switcher import (
-    CCSWITCH_KEYCHAIN_SERVICE,
-    CLAUDE_CREDENTIALS_SERVICE,
-    SETUP_TOKEN_SERVICE,
-    Switcher,
-)
+from ccswitch.oauth import login_blob
 
 
-# ---- Fakes / fixtures ---------------------------------------------------
-
-
-class FakeKeychain:
-    """In-memory ``(service, account) -> value`` store."""
-
-    def __init__(self) -> None:
-        self.entries: dict[tuple[str, str], str] = {}
-
-    def read(self, service: str, account: str) -> str | None:
-        return self.entries.get((service, account))
-
-    def write(self, service: str, account: str, value: str) -> None:
-        self.entries[(service, account)] = value
-
-    def delete(self, service: str, account: str) -> None:
-        self.entries.pop((service, account), None)
+def blob(token, **extra):
+    return json.dumps({"claudeAiOauth": {"accessToken": token, "refreshToken": token + "-refresh",
+                                       "expiresAt": 99999999999999, "scopes": ["user:inference"]}, **extra})
 
 
 @pytest.fixture
-def fake_kc(monkeypatch: pytest.MonkeyPatch) -> FakeKeychain:
-    kc = FakeKeychain()
-    monkeypatch.setattr(switcher_mod, "keychain_read", kc.read)
-    monkeypatch.setattr(switcher_mod, "keychain_write", kc.write)
-    monkeypatch.setattr(switcher_mod, "keychain_delete", kc.delete)
-    monkeypatch.setenv("USER", "tester")
-    return kc
+def state(tmp_home, monkeypatch):
+    config = tmp_home / ".claude.json"
+    accounts = {name: {"emailAddress": name + "@example.invalid", "organizationUuid": name,
+                      "accountUuid": name} for name in ("a", "b")}
+    config.write_text(json.dumps({"oauthAccount": accounts["a"], "projects": {"old": {}}}))
+    store = AccountStore(tmp_home / "accounts.json")
+    for name, data in accounts.items():
+        store.add(Account(name, data["emailAddress"], name, data))
+    live = (mod.CLAUDE_CREDENTIALS_SERVICE, "review-user")
+    def saved(name):
+        return mod.CCSWITCH_KEYCHAIN_SERVICE, name
+    entries = {live: blob("a-live"), saved("a"): blob("a-saved"), saved("b"): blob("b-saved")}
+    monkeypatch.setattr(mod, "_current_user", lambda: "review-user")
+    monkeypatch.setattr(mod, "keychain_read", lambda service, account: entries.get((service, account)))
+    monkeypatch.setattr(mod, "keychain_write", lambda service, account, value: entries.__setitem__((service, account), value))
+    monkeypatch.setattr(mod, "keychain_delete", lambda service, account: entries.pop((service, account), None))
+    monkeypatch.setattr(mod, "refresh_oauth_credentials", lambda value: pytest.fail("Unexpected refresh"))
+    output = io.StringIO()
+    sw = mod.Switcher(store, Console(file=output, force_terminal=False))
+    return SimpleNamespace(config=config, accounts=accounts, entries=entries, live=live, saved=saved,
+                           sw=sw, output=output, store=store, root=tmp_home / ".claude")
 
 
-@pytest.fixture
-def claude_config_path(tmp_home: Path) -> Path:
-    return tmp_home / ".claude.json"
+def active(state):
+    return json.loads(state.entries[state.live])["claudeAiOauth"]["accessToken"]
 
 
-def _write_claude_config(path: Path, oauth: dict | None, extra: dict | None = None) -> None:
-    data: dict[str, Any] = {
-        "userID": "user-xyz",
-        "projects": {"/Users/leo/code": {"sessions": ["sess-1"]}},
-        "version": "1.0.0",
-    }
-    if extra:
-        data.update(extra)
-    if oauth is not None:
-        data["oauthAccount"] = oauth
-    path.write_text(json.dumps(data, indent=2))
+def test_same_account_keeps_live_rotated_token(state):
+    state.sw.use("a")
+    assert active(state) == "a-live"
+    assert state.entries[state.saved("a")] == login_blob(state.entries[state.live])
 
 
-def _oauth(email: str, org_uuid: str, org_name: str = "Org") -> dict:
-    return {
-        "accountUuid": "acc-" + org_uuid,
-        "emailAddress": email,
-        "organizationUuid": org_uuid,
-        "organizationName": org_name,
-    }
+def test_switch_and_back_preserve_freshest_login_and_other_secrets(state):
+    extra = {"mcpOAuth": {"server": "current"}, "pluginSecrets": {"plugin": "current"}}
+    state.entries[state.live] = blob("a-live", **extra)
+    state.entries[state.saved("b")] = blob("b-saved", mcpOAuth={"server": "obsolete"})
+    state.sw.use("b")
+    assert active(state) == "b-saved"
+    assert json.loads(state.entries[state.live])["mcpOAuth"] == extra["mcpOAuth"]
+    assert json.loads(state.entries[state.live])["pluginSecrets"] == extra["pluginSecrets"]
+    assert set(json.loads(state.entries[state.saved("a")])) == {"claudeAiOauth"}
+    assert json.loads(state.config.read_text())["projects"] == {"old": {}}
+    state.entries[state.live] = blob("b-rotated", **extra)
+    state.sw.use("a")
+    assert active(state) == "a-live"
+    state.sw.use("b")
+    assert active(state) == "b-rotated"
 
 
-def _make_switcher(
-    tmp_home: Path,
-    console: Console | None = None,
-) -> tuple[Switcher, AccountStore]:
-    store_path = tmp_home / ".config" / "ccswitch" / "accounts.json"
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    store = AccountStore(store_path)
-    sw = Switcher(store=store, console=console or Console(record=True, force_terminal=False))
-    return sw, store
+def test_refresh_uses_locks_and_retains_concurrent_mcp_and_config_updates(state, monkeypatch):
+    old = json.loads(state.entries[state.saved("b")])
+    old["claudeAiOauth"]["expiresAt"] = 1
+    state.entries[state.saved("b")] = json.dumps(old)
+    def refresh(value):
+        assert (state.root / ".oauth_refresh.lock").is_dir()
+        assert state.root.parent.joinpath(state.root.name + ".lock").is_dir()
+        assert not (state.root / ".storage-write.lock").exists()
+        assert not state.config.with_suffix(".json.lock").exists()
+        data = json.loads(state.config.read_text())
+        data["projects"]["new-project"] = {"trusted": True}
+        state.config.write_text(json.dumps(data))
+        state.entries[state.live] = blob("a-live", mcpOAuth={"server": "refreshed"})
+        return blob("b-refreshed")
+    monkeypatch.setattr(mod, "refresh_oauth_credentials", refresh)
+    state.sw.use("b")
+    assert active(state) == "b-refreshed"
+    assert json.loads(state.config.read_text())["projects"]["new-project"] == {"trusted": True}
+    assert json.loads(state.entries[state.live])["mcpOAuth"]["server"] == "refreshed"
 
 
-def _record_console() -> Console:
-    return Console(record=True, force_terminal=False, width=200)
+def test_keychain_failure_does_not_change_config(state, monkeypatch):
+    original = mod.keychain_write
+    failed = False
+    def write(service, account, value):
+        nonlocal failed
+        if (service, account) == state.live and not failed:
+            failed = True
+            raise KeychainError("Simulated denied write")
+        original(service, account, value)
+    monkeypatch.setattr(mod, "keychain_write", write)
+    with pytest.raises(KeychainError):
+        state.sw.use("b")
+    assert json.loads(state.config.read_text())["oauthAccount"] == state.accounts["a"]
+    assert active(state) == "a-live"
+    assert (mod.RECOVERY_SERVICE, state.sw._recovery_key) not in state.entries
 
 
-# ---- add ----------------------------------------------------------------
+def test_config_failure_rolls_back_keychain(state, monkeypatch):
+    original = mod.write_json_atomic
+    failed = False
+    def write(path, value):
+        nonlocal failed
+        if path == state.config and not failed:
+            failed = True
+            raise OSError("Simulated config failure")
+        original(path, value)
+    monkeypatch.setattr(mod, "write_json_atomic", write)
+    with pytest.raises(OSError):
+        state.sw.use("b")
+    assert active(state) == "a-live"
+    assert json.loads(state.config.read_text())["oauthAccount"] == state.accounts["a"]
 
 
-def test_add_saves_active_account_default_label(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1", "Example Org"))
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", '{"claudeAiOauth": {"x": 1}}')
-
-    sw, store = _make_switcher(tmp_home)
-
-    # Force the prompt to return the suggested default.
-    captured = {}
-
-    def fake_prompt(message: str, default: str | None = None) -> str:
-        captured["default"] = default
-        return default or "fallback"
-
-    sw._prompt_text = fake_prompt  # type: ignore[assignment]
-
-    sw.add()
-
-    assert captured["default"] == "work-example-org"
-    saved = store.get("work-example-org")
-    assert saved is not None
-    assert saved.email == "work@example.com"
-    assert saved.organization_name == "Example Org"
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "work-example-org")] == '{"claudeAiOauth": {"x": 1}}'
+def test_failed_rollback_is_recoverable_and_blocks_another_switch(state, monkeypatch):
+    original = mod.write_json_atomic
+    monkeypatch.setattr(mod, "write_json_atomic", lambda *args: (_ for _ in ()).throw(OSError("disk failure")))
+    with pytest.raises(ValueError, match="Recovery data"):
+        state.sw.use("b")
+    assert (mod.RECOVERY_SERVICE, state.sw._recovery_key) in state.entries
+    with pytest.raises(ValueError, match="recover"):
+        state.sw.use("b")
+    monkeypatch.setattr(mod, "write_json_atomic", original)
+    state.sw.recover()
+    assert active(state) == "a-live"
+    assert (mod.RECOVERY_SERVICE, state.sw._recovery_key) not in state.entries
 
 
-def test_add_with_label_override_skips_prompt(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1", "Example Org"))
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "blob")
-
-    sw, store = _make_switcher(tmp_home)
-    sw._prompt_text = lambda *_args, **_kwargs: pytest.fail("prompt should not be called")  # type: ignore[assignment]
-
-    sw.add(label_override="custom-label")
-
-    assert store.get("custom-label") is not None
+def seed_journal(state):
+    state.entries[mod.RECOVERY_SERVICE, state.sw._recovery_key] = json.dumps({
+        "oldLogin": json.loads(blob("a-live"))["claudeAiOauth"],
+        "newLogin": json.loads(blob("b-saved"))["claudeAiOauth"],
+        "oldAccount": state.accounts["a"], "newAccount": state.accounts["b"],
+    })
 
 
-def test_add_same_identity_existing_prompts_to_update(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    oauth = _oauth("work@example.com", "org-1", "Example Org")
-    _write_claude_config(claude_config_path, oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "new-blob")
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", oauth))
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", "old-blob")
-
-    sw._confirm = lambda *_a, **_kw: True  # type: ignore[assignment]
-    sw.add(label_override="work")
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "work")] == "new-blob"
+def test_recover_refuses_to_overwrite_later_login(state):
+    seed_journal(state)
+    state.entries[state.live] = blob("manual-new-login")
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        state.sw.recover()
+    assert active(state) == "manual-new-login"
+    state.sw.recover(keep_current=True)
+    assert active(state) == "manual-new-login"
+    assert (mod.RECOVERY_SERVICE, state.sw._recovery_key) not in state.entries
 
 
-def test_add_different_identity_existing_label_raises(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1", "Example Org"))
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "blob")
-
-    sw, store = _make_switcher(tmp_home)
-    # Existing entry under same label but for a *different* identity.
-    store.add(Account("collision", "other@x.com", "Other", _oauth("other@x.com", "org-2", "Other")))
-
-    with pytest.raises(ValueError, match="already in use"):
-        sw.add(label_override="collision")
+def test_crash_journal_restores_only_login_fields(state):
+    seed_journal(state)
+    state.entries[state.live] = blob("b-saved", pluginSecrets={"new": "keep"})
+    state.sw.recover()
+    assert active(state) == "a-live"
+    assert json.loads(state.entries[state.live])["pluginSecrets"] == {"new": "keep"}
 
 
-def test_add_raises_when_no_oauth_account(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, None)
-    sw, _ = _make_switcher(tmp_home)
-    with pytest.raises(ValueError, match="no oauthAccount"):
-        sw.add(label_override="x")
+def test_failed_refresh_leaves_active_login_unchanged(state, monkeypatch):
+    expired = json.loads(blob("b-expired"))
+    expired["claudeAiOauth"]["expiresAt"] = 1
+    state.entries[state.saved("b")] = json.dumps(expired)
+    monkeypatch.setattr(mod, "refresh_oauth_credentials", lambda value: None)
+    with pytest.raises(ValueError, match="Refresh failed"):
+        state.sw.use("b")
+    assert active(state) == "a-live"
+    assert json.loads(state.config.read_text())["oauthAccount"] == state.accounts["a"]
 
 
-def test_add_raises_when_no_active_credentials(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1"))
-    sw, _ = _make_switcher(tmp_home)
-    with pytest.raises(ValueError, match="No active Claude Code credentials"):
-        sw.add(label_override="x")
-
-
-def test_add_bad_label_raises(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1"))
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "blob")
-
-    sw, _ = _make_switcher(tmp_home)
+@pytest.mark.parametrize("saved", ["{broken", "{}", "[]", '{"claudeAiOauth": {"accessToken": "x"}}'])
+def test_invalid_saved_login_never_replaces_active(state, saved):
+    state.entries[state.saved("b")] = saved
     with pytest.raises(ValueError):
-        sw.add(label_override="bad label")
+        state.sw.use("b")
+    assert active(state) == "a-live"
 
 
-# ---- list_accounts ------------------------------------------------------
-
-
-def test_list_empty_store(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    console = _record_console()
-    sw, _ = _make_switcher(tmp_home, console=console)
-    sw.list_accounts()
-    out = console.export_text()
-    assert "No saved accounts" in out
-
-
-def test_list_marks_active(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    active_oauth = _oauth("work@example.com", "org-1", "Example Org")
-    _write_claude_config(claude_config_path, active_oauth)
-
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "", _oauth("personal@example.com", "org-9", "")))
-
-    sw.list_accounts()
-    out = console.export_text()
-    assert "work" in out
-    assert "personal" in out
-    # Active marker appears on the active row (●).
-    lines = out.splitlines()
-    leo_bg_line = next(line for line in lines if "work" in line)
-    personal_line = next(line for line in lines if "personal" in line)
-    assert "●" in leo_bg_line
-    assert "●" not in personal_line
-
-
-def test_list_no_claude_config_still_renders(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    # No .claude.json at all → table renders without an active marker.
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("work", "work@example.com", "Example Org", _oauth("work@example.com", "org-1")))
-    sw.list_accounts()
-    out = console.export_text()
-    assert "work" in out
-    assert "●" not in out
-
-
-# ---- current ------------------------------------------------------------
-
-
-def test_current_active_saved(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    oauth = _oauth("work@example.com", "org-1", "Example Org")
-    _write_claude_config(claude_config_path, oauth)
-
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("work", "work@example.com", "Example Org", oauth))
-
-    sw.current()
-    out = console.export_text()
-    assert "work" in out
-    assert "work@example.com" in out
-
-
-def test_current_active_not_saved(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1", "Example Org"))
-    console = _record_console()
-    sw, _ = _make_switcher(tmp_home, console=console)
-    sw.current()
-    out = console.export_text()
-    assert "work@example.com" in out
-    assert "not saved" in out
-
-
-def test_current_no_oauth(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, None)
-    console = _record_console()
-    sw, _ = _make_switcher(tmp_home, console=console)
-    sw.current()
-    out = console.export_text()
-    assert "No active Claude account" in out
-
-
-# ---- use ----------------------------------------------------------------
-
-
-def test_use_happy_path_preserves_other_fields(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """AE1: only oauthAccount changes in ~/.claude.json."""
-    old_oauth = _oauth("old@x.com", "org-old", "Old")
-    new_oauth = _oauth("new@x.com", "org-new", "New")
-    _write_claude_config(
-        claude_config_path,
-        old_oauth,
-        extra={
-            "projects": {"/foo": {"history": ["a", "b", "c"]}},
-            "telemetry": {"sessions": 99},
-        },
-    )
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "old-blob")
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "new-acc", '{"claudeAiOauth": {"accessToken": "x"}}')
-
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("old-acc", "old@x.com", "Old", old_oauth))
-    store.add(Account("new-acc", "new@x.com", "New", new_oauth))
-
-    sw.use("new-acc")
-
-    config_after = json.loads(claude_config_path.read_text())
-    assert config_after["oauthAccount"] == new_oauth
-    assert config_after["projects"] == {"/foo": {"history": ["a", "b", "c"]}}
-    assert config_after["telemetry"] == {"sessions": 99}
-    assert config_after["userID"] == "user-xyz"
-    assert config_after["version"] == "1.0.0"
-    # AE2: live Keychain entry now contains the saved blob.
-    assert (
-        fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")]
-        == '{"claudeAiOauth": {"accessToken": "x"}}'
-    )
-    out = console.export_text()
-    assert "30" in out  # cache warning seconds
-    assert "restart" in out.lower() or "session" in out.lower()
-
-
-def test_use_prompts_to_save_unsaved_active_then_proceeds(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """AE6: active account not saved → prompt to save first."""
-    active_oauth = _oauth("active@x.com", "org-active", "ActiveOrg")
-    target_oauth = _oauth("target@x.com", "org-target", "TargetOrg")
-    _write_claude_config(claude_config_path, active_oauth)
-    active_blob = '{"claudeAiOauth": {"accessToken": "a"}}'
-    target_blob = '{"claudeAiOauth": {"accessToken": "t"}}'
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", active_blob)
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "target", target_blob)
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("target", "target@x.com", "TargetOrg", target_oauth))
-
-    sw._confirm = lambda *_a, **_kw: True  # type: ignore[assignment]
-    sw.use("target")
-
-    # Active was saved with the suggested default name.
-    assert store.get("active-activeorg") is not None
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "active-activeorg")] == active_blob
-    # Switch then proceeded.
-    config_after = json.loads(claude_config_path.read_text())
-    assert config_after["oauthAccount"] == target_oauth
-
-
-def test_use_aborts_when_user_declines_save_prompt(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    active_oauth = _oauth("active@x.com", "org-active")
-    target_oauth = _oauth("target@x.com", "org-target")
-    _write_claude_config(claude_config_path, active_oauth)
-    active_blob = '{"claudeAiOauth": {"accessToken": "a"}}'
-    target_blob = '{"claudeAiOauth": {"accessToken": "t"}}'
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", active_blob)
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "target", target_blob)
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("target", "target@x.com", "Org", target_oauth))
-
-    sw._confirm = lambda *_a, **_kw: False  # type: ignore[assignment]
-    sw.use("target")
-
-    # Nothing changed.
-    config_after = json.loads(claude_config_path.read_text())
-    assert config_after["oauthAccount"] == active_oauth
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == active_blob
-
-
-def test_use_missing_keychain_entry_aborts_before_any_write(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """AE7: missing Keychain entry → abort before any write."""
-    active_oauth = _oauth("work@example.com", "org-1")
-    target_oauth = _oauth("personal@example.com", "org-2")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "active-blob")
-    # Intentionally do NOT write the ccswitch:personal Keychain entry.
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "Personal", target_oauth))
-
-    config_before = claude_config_path.read_text()
+def test_missing_saved_login_never_replaces_active(state):
+    del state.entries[state.saved("b")]
     with pytest.raises(ValueError, match="missing"):
-        sw.use("personal")
-
-    # Live state untouched.
-    assert claude_config_path.read_text() == config_before
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == "active-blob"
-
-
-def test_use_unparseable_blob_aborts_before_any_write(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    active_oauth = _oauth("work@example.com", "org-1")
-    target_oauth = _oauth("personal@example.com", "org-2")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "active-blob")
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", "{not json")
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "Personal", target_oauth))
-
-    config_before = claude_config_path.read_text()
-    with pytest.raises(ValueError, match="not valid JSON"):
-        sw.use("personal")
-    assert claude_config_path.read_text() == config_before
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == "active-blob"
-
-
-def test_use_missing_claude_config_raises_file_not_found(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", '{"claudeAiOauth": {}}')
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", _oauth("work@example.com", "org-1")))
-
-    with pytest.raises(FileNotFoundError):
-        sw.use("work")
-
-
-def test_use_unparseable_claude_config_raises_value_error(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    claude_config_path.write_text("{not json")
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", '{"claudeAiOauth": {}}')
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", _oauth("work@example.com", "org-1")))
-
-    with pytest.raises(ValueError, match="Cannot parse"):
-        sw.use("work")
-
-
-def test_use_unknown_label_raises(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1"))
-    sw, _ = _make_switcher(tmp_home)
-    with pytest.raises(ValueError, match="No saved account"):
-        sw.use("ghost")
-
-
-# ---- remove -------------------------------------------------------------
-
-
-def test_remove_happy_path(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", _oauth("work@example.com", "org-1")))
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", "blob")
-
-    sw._confirm = lambda *_a, **_kw: True  # type: ignore[assignment]
-    sw.remove("work")
-
-    assert store.get("work") is None
-    assert (CCSWITCH_KEYCHAIN_SERVICE, "work") not in fake_kc.entries
-
-
-def test_remove_active_label_warns_but_proceeds(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """AE8: removing the active label warns; Claude state unchanged."""
-    active_oauth = _oauth("work@example.com", "org-1", "Example Org")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", "active-blob")
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", "saved-blob")
-
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-
-    sw._confirm = lambda *_a, **_kw: True  # type: ignore[assignment]
-    sw.remove("work")
-
-    out = console.export_text()
-    assert "currently active" in out.lower() or "Warning" in out
-    # Saved metadata + ccswitch keychain entry gone.
-    assert store.get("work") is None
-    assert (CCSWITCH_KEYCHAIN_SERVICE, "work") not in fake_kc.entries
-    # Live Claude state untouched.
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == "active-blob"
-    config_after = json.loads(claude_config_path.read_text())
-    assert config_after["oauthAccount"] == active_oauth
-
-
-def test_remove_user_declines_no_changes(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", _oauth("work@example.com", "org-1")))
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", "blob")
-
-    sw._confirm = lambda *_a, **_kw: False  # type: ignore[assignment]
-    sw.remove("work")
-
-    assert store.get("work") is not None
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "work")] == "blob"
-
-
-def test_remove_unknown_label_raises(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, _ = _make_switcher(tmp_home)
-    with pytest.raises(ValueError, match="No saved account"):
-        sw.remove("ghost")
-
-
-# ---- refresh-on-switch --------------------------------------------------
-
-
-def _expired_blob(refresh: str = "refresh-tok") -> str:
-    return json.dumps(
-        {
-            "claudeAiOauth": {
-                "accessToken": "old-access",
-                "refreshToken": refresh,
-                "expiresAt": 1,  # ~epoch — definitely expired
-                "scopes": ["user:inference"],
-            }
-        }
-    )
-
-
-def _fresh_blob() -> str:
-    from datetime import datetime, timezone
-    future_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 60 * 60 * 1000
-    return json.dumps(
-        {
-            "claudeAiOauth": {
-                "accessToken": "fresh-access",
-                "refreshToken": "refresh-tok",
-                "expiresAt": future_ms,
-                "scopes": ["user:inference"],
-            }
-        }
-    )
-
-
-def test_use_refreshes_expired_saved_blob_before_writing_live(
-    tmp_home: Path,
-    fake_kc: FakeKeychain,
-    claude_config_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    active_oauth = _oauth("work@example.com", "org-1")
-    target_oauth = _oauth("personal@example.com", "org-2")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", _fresh_blob())
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", _fresh_blob())  # active is saved
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", _expired_blob())
-
-    refreshed_blob = json.dumps(
-        {
-            "claudeAiOauth": {
-                "accessToken": "MINT-NEW",
-                "refreshToken": "refresh-tok",
-                "expiresAt": 99999999999999,
-                "scopes": ["user:inference"],
-            }
-        }
-    )
-    monkeypatch.setattr(
-        switcher_mod, "refresh_oauth_credentials", lambda _b: refreshed_blob
-    )
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "Personal", target_oauth))
-
-    sw.use("personal")
-
-    # Live Claude Code-credentials got the REFRESHED blob, not the original expired one.
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == refreshed_blob
-    # The saved ccswitch:personal entry was also updated so future switches don't re-refresh.
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "personal")] == refreshed_blob
-
-
-def test_use_skips_refresh_when_token_still_fresh(
-    tmp_home: Path,
-    fake_kc: FakeKeychain,
-    claude_config_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    active_oauth = _oauth("work@example.com", "org-1")
-    target_oauth = _oauth("personal@example.com", "org-2")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", _fresh_blob())
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", _fresh_blob())
-    fresh_target = _fresh_blob()
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", fresh_target)
-
-    refresh_called = False
-
-    def boom(_blob: str) -> None:
-        nonlocal refresh_called
-        refresh_called = True
-        return None
-
-    monkeypatch.setattr(switcher_mod, "refresh_oauth_credentials", boom)
-
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "Personal", target_oauth))
-
-    sw.use("personal")
-
-    assert refresh_called is False
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == fresh_target
-
-
-def test_use_warns_and_proceeds_when_refresh_fails(
-    tmp_home: Path,
-    fake_kc: FakeKeychain,
-    claude_config_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    active_oauth = _oauth("work@example.com", "org-1")
-    target_oauth = _oauth("personal@example.com", "org-2")
-    _write_claude_config(claude_config_path, active_oauth)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", _fresh_blob())
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", _fresh_blob())
-    expired = _expired_blob()
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", expired)
-
-    monkeypatch.setattr(switcher_mod, "refresh_oauth_credentials", lambda _b: None)
-
-    console = _record_console()
-    sw, store = _make_switcher(tmp_home, console=console)
-    store.add(Account("work", "work@example.com", "Example Org", active_oauth))
-    store.add(Account("personal", "personal@example.com", "Personal", target_oauth))
-
-    sw.use("personal")
-
-    out = console.export_text()
-    assert "expired" in out
-    assert "re-login" in out.lower() or "ccswitch add" in out
-    # Stale blob was still written through to live state (Claude Code will show its own 401).
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == expired
-
-
-# ---- use: re-capture active account's live credentials ------------------
-
-
-def test_use_recaptures_active_saved_account_before_switching(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """Switching away from an active, already-saved account must save its freshest creds.
-
-    The live Keychain entry holds that account's latest (rotated) tokens; its
-    saved ccswitch copy is older and its refresh token is likely already dead.
-    `use` must re-capture the live blob into the saved entry before overwriting
-    the live entry, or the next `use` of that account fails to refresh.
-    """
-    _write_claude_config(claude_config_path, _oauth("personal@x.com", "org-p", "Personal"))
-    sw, store = _make_switcher(tmp_home)
-    store.add(
-        Account("personal", "personal@x.com", "Personal", _oauth("personal@x.com", "org-p", "Personal"))
-    )
-    store.add(Account("work", "work@x.com", "Work", _oauth("work@x.com", "org-w", "Work")))
-
-    old_personal = '{"claudeAiOauth": {"accessToken": "OLD", "refreshToken": "RT_OLD", "scopes": ["user:inference"]}}'
-    fresh_personal = '{"claudeAiOauth": {"accessToken": "NEW", "refreshToken": "RT_NEW", "scopes": ["user:inference"]}}'
-    work_blob = '{"claudeAiOauth": {"accessToken": "WORK", "refreshToken": "RT_WORK", "scopes": ["user:inference"]}}'
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "personal", old_personal)
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", work_blob)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", fresh_personal)
-
-    sw.use("work")
-
-    # personal's saved copy now holds the freshest live (rotated) credentials...
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "personal")] == fresh_personal
-    # ...and the live entry holds work's blob (the switch happened).
-    assert fake_kc.entries[(CLAUDE_CREDENTIALS_SERVICE, "tester")] == work_blob
-
-
-def test_use_does_not_recapture_when_switching_to_active_account(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """Re-using the already-active account must not clobber its own saved entry."""
-    _write_claude_config(claude_config_path, _oauth("work@x.com", "org-w", "Work"))
-    sw, store = _make_switcher(tmp_home)
-    store.add(Account("work", "work@x.com", "Work", _oauth("work@x.com", "org-w", "Work")))
-
-    saved_work = '{"claudeAiOauth": {"accessToken": "SAVED", "refreshToken": "RT", "scopes": ["user:inference"]}}'
-    live_work = '{"claudeAiOauth": {"accessToken": "LIVE", "refreshToken": "RT", "scopes": ["user:inference"]}}'
-    fake_kc.write(CCSWITCH_KEYCHAIN_SERVICE, "work", saved_work)
-    fake_kc.write(CLAUDE_CREDENTIALS_SERVICE, "tester", live_work)
-
-    sw.use("work")
-
-    # The saved entry is untouched (no spurious re-capture onto itself).
-    assert fake_kc.entries[(CCSWITCH_KEYCHAIN_SERVICE, "work")] == saved_work
-
-
-# ---- add_token ----------------------------------------------------------
-
-
-def _save_account(store: AccountStore, label: str = "work") -> None:
-    store.add(
-        Account(
-            label=label,
-            email="work@example.com",
-            organization_name="Example Org",
-            oauth_account=_oauth("work@example.com", "org-1", "Example Org"),
-        )
-    )
-
-
-def test_add_token_stores_token_under_token_service(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, store = _make_switcher(tmp_home)
-    _save_account(store)
-
-    sw.add_token("work", token="sk-ant-oat01-LONGLIVED")
-
-    assert fake_kc.entries[(SETUP_TOKEN_SERVICE, "work")] == "sk-ant-oat01-LONGLIVED"
-
-
-def test_add_token_requires_existing_account(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, _ = _make_switcher(tmp_home)
-    with pytest.raises(ValueError, match="No saved account"):
-        sw.add_token("ghost", token="sk-ant-oat01-X")
-
-
-def test_add_token_rejects_empty_token(tmp_home: Path, fake_kc: FakeKeychain) -> None:
-    sw, store = _make_switcher(tmp_home)
-    _save_account(store)
-    with pytest.raises(ValueError, match="[Tt]oken"):
-        sw.add_token("work", token="   ")
-
-
-def test_add_token_prompts_when_token_omitted(
-    tmp_home: Path, fake_kc: FakeKeychain
-) -> None:
-    sw, store = _make_switcher(tmp_home)
-    _save_account(store)
-
-    def fake_prompt(_message: str, **_kwargs: object) -> str:
-        return "  sk-ant-oat01-PROMPTED  "
-
-    sw._prompt_text = fake_prompt  # type: ignore[method-assign]
-    sw.add_token("work")
-
-    # Whitespace is trimmed before storing.
-    assert fake_kc.entries[(SETUP_TOKEN_SERVICE, "work")] == "sk-ant-oat01-PROMPTED"
-
-
-# ---- error propagation --------------------------------------------------
-
-
-def test_keychain_error_propagates(
-    tmp_home: Path, fake_kc: FakeKeychain, claude_config_path: Path
-) -> None:
-    """A real KeychainError from the keychain layer must bubble up so the CLI can catch it."""
-    _write_claude_config(claude_config_path, _oauth("work@example.com", "org-1"))
-
-    def boom(*_args: object, **_kwargs: object) -> None:
-        raise KeychainError("kc broken")
-
-    import ccswitch.switcher as sw_mod
-    original_read = sw_mod.keychain_read
-    sw_mod.keychain_read = boom  # type: ignore[assignment]
-    try:
-        sw, _ = _make_switcher(tmp_home)
-        with pytest.raises(KeychainError, match="kc broken"):
-            sw.add(label_override="x")
-    finally:
-        sw_mod.keychain_read = original_read  # type: ignore[assignment]
+        state.sw.use("b")
+    assert active(state) == "a-live"
+
+
+def test_custom_config_service_does_not_touch_default_keychain(state, monkeypatch, tmp_home):
+    from ccswitch.paths import get_credentials_service
+    alt = tmp_home / "alternate"
+    alt.mkdir()
+    (alt / ".claude.json").write_text(state.config.read_text())
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alt))
+    service = get_credentials_service()
+    state.entries[service, "review-user"] = blob("alt-live")
+    state.sw.use("b")
+    assert active(state) == "a-live"
+    assert json.loads(state.entries[service, "review-user"])["claudeAiOauth"]["accessToken"] == "b-saved"
+
+
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL"])
+def test_environment_override_refuses_switch(state, monkeypatch, key):
+    monkeypatch.setenv(key, "synthetic-value")
+    before = dict(state.entries)
+    with pytest.raises(ValueError, match=key):
+        state.sw.use("b")
+    assert state.entries == before
+
+
+def test_wait_releases_all_claude_locks_before_sleep(state, monkeypatch):
+    waits = []
+    def sleep(seconds):
+        waits.append(seconds)
+        assert not (state.root / ".oauth_refresh.lock").exists()
+        assert not (state.root / ".storage-write.lock").exists()
+    monkeypatch.setattr(mod.time, "sleep", sleep)
+    state.sw.use("b", wait=True)
+    assert waits == [30]
+
+
+def test_add_saves_only_login_and_refuses_label_identity_collision(state):
+    state.entries[state.live] = blob("a-live", pluginSecrets={"secret": "not-a-profile"})
+    state.sw.add("new-label")
+    assert set(json.loads(state.entries[state.saved("new-label")])) == {"claudeAiOauth"}
+    with pytest.raises(ValueError, match="different account"):
+        state.sw.add("b")
+
+
+def test_add_updates_credentials_after_manual_login(state):
+    state.entries[state.live] = blob("a-new-login")
+    state.sw._confirm = lambda *args, **kwargs: True
+    state.sw.add("a")
+    assert state.entries[state.saved("a")] == blob("a-new-login")
+
+
+def test_unsaved_active_decline_does_not_mutate_login(state):
+    state.store.remove("a")
+    state.sw._confirm = lambda *args, **kwargs: False
+    state.sw.use("b")
+    assert active(state) == "a-live"
+
+
+def test_unsaved_active_can_be_captured_before_switch(state):
+    state.store.remove("a")
+    state.sw._confirm = lambda *args, **kwargs: True
+    state.sw.use("b")
+    assert state.store.get("a") is not None
+    assert active(state) == "b-saved"
+
+
+def test_list_and_current_use_metadata_only(state):
+    state.sw.current()
+    state.sw.list_accounts()
+    assert "a@example.invalid" in state.output.getvalue()
+    assert "b@example.invalid" in state.output.getvalue()
+
+
+def test_remove_does_not_change_active_login(state):
+    state.sw._confirm = lambda *args, **kwargs: True
+    state.sw.remove("a")
+    assert state.store.get("a") is None
+    assert active(state) == "a-live"
+
+
+def test_setup_token_saved_separately(state):
+    state.sw.add_token("a", "synthetic-setup-token")
+    assert state.entries[mod.SETUP_TOKEN_SERVICE, "a"] == "synthetic-setup-token"
+    assert active(state) == "a-live"

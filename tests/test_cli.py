@@ -32,8 +32,14 @@ def fake_switcher(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def current(self) -> None:
             calls["calls"].append(("current", {}))
 
-        def use(self, label: str) -> None:
-            calls["calls"].append(("use", {"label": label}))
+        def use(self, label: str, wait: bool = False) -> None:
+            calls["calls"].append(("use", {"label": label, "wait": wait}))
+
+        def recover(self, keep_current: bool = False) -> None:
+            calls["calls"].append(("recover", {"keep_current": keep_current}))
+
+        def add_token(self, label: str) -> None:
+            calls["calls"].append(("add-token", {"label": label}))
 
         def remove(self, label: str) -> None:
             calls["calls"].append(("remove", {"label": label}))
@@ -59,10 +65,10 @@ def fake_run_with_account(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 # ---- help ---------------------------------------------------------------
 
 
-def test_help_shows_all_six_subcommands() -> None:
+def test_help_shows_all_subcommands() -> None:
     result = runner.invoke(cli_mod.app, ["--help"])
     assert result.exit_code == 0
-    for name in ("add", "list", "current", "use", "remove", "exec"):
+    for name in ("add", "add-token", "list", "current", "use", "recover", "remove", "exec"):
         assert name in result.stdout
 
 
@@ -84,7 +90,7 @@ def test_current_invokes_current(fake_switcher: dict) -> None:
 def test_use_forwards_label(fake_switcher: dict) -> None:
     result = runner.invoke(cli_mod.app, ["use", "work"])
     assert result.exit_code == 0
-    assert ("use", {"label": "work"}) in fake_switcher["calls"]
+    assert ("use", {"label": "work", "wait": False}) in fake_switcher["calls"]
 
 
 def test_remove_forwards_label(fake_switcher: dict) -> None:
@@ -185,3 +191,28 @@ def test_unhandled_exception_propagates(monkeypatch: pytest.MonkeyPatch) -> None
     # RuntimeError is not in _HANDLED_ERRORS — the CliRunner should surface it.
     assert result.exit_code != 0
     assert isinstance(result.exception, RuntimeError)
+
+
+def test_use_wait_flag(fake_switcher):
+    result = runner.invoke(cli_mod.app, ["use", "work", "--wait"])
+    assert result.exit_code == 0
+    assert ("use", {"label": "work", "wait": True}) in fake_switcher["calls"]
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_recovery_modes(fake_switcher, keep):
+    result = runner.invoke(cli_mod.app, ["recover"] + (["--keep-current"] if keep else []))
+    assert result.exit_code == 0
+    assert ("recover", {"keep_current": keep}) in fake_switcher["calls"]
+
+
+def test_add_token_rejects_secret_in_arguments(fake_switcher):
+    result = runner.invoke(cli_mod.app, ["add-token", "work", "--token", "synthetic-secret"])
+    assert result.exit_code == 2
+    assert not fake_switcher["calls"]
+
+
+def test_add_token_uses_prompt_path(fake_switcher):
+    result = runner.invoke(cli_mod.app, ["add-token", "work"])
+    assert result.exit_code == 0
+    assert ("add-token", {"label": "work"}) in fake_switcher["calls"]

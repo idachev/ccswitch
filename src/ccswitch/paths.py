@@ -17,11 +17,13 @@ path, otherwise ``~/.config/ccswitch``.
 from __future__ import annotations
 
 import os
+import hashlib
+import unicodedata
 from pathlib import Path
 
 
 def _claude_config_home() -> Path:
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    env = _config_override()
     if env:
         return Path(env)
     return Path.home() / ".claude"
@@ -36,9 +38,16 @@ def get_claude_config_path() -> Path:
     legacy = _claude_config_home() / ".config.json"
     if legacy.exists():
         return legacy
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    env = _config_override()
     base = Path(env) if env else Path.home()
     return base / ".claude.json"
+
+
+def _config_override() -> str:
+    raw = unicodedata.normalize("NFC", os.environ.get("CLAUDE_CONFIG_DIR", ""))
+    if raw and not Path(raw).is_absolute():
+        raise ValueError("CLAUDE_CONFIG_DIR must be an absolute path.")
+    return raw
 
 
 def get_ccswitch_config_dir() -> Path:
@@ -58,3 +67,24 @@ def get_ccswitch_config_dir() -> Path:
 def get_accounts_file() -> Path:
     """Return the path to ``accounts.json`` inside the ccswitch config dir."""
     return get_ccswitch_config_dir() / "accounts.json"
+
+
+def _explicit_storage_path() -> str:
+    raw = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if raw is None:
+        raw = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    raw = unicodedata.normalize("NFC", raw)
+    if raw and not Path(raw).is_absolute():
+        raise ValueError("CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR must be absolute paths.")
+    return raw
+
+
+def get_secure_storage_dir() -> Path:
+    raw = _explicit_storage_path()
+    return Path(raw) if raw else Path.home() / ".claude"
+
+
+def get_credentials_service() -> str:
+    raw = _explicit_storage_path()
+    suffix = "-" + hashlib.sha256(raw.encode()).hexdigest()[:8] if raw else ""
+    return "Claude Code-credentials" + suffix
