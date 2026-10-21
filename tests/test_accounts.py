@@ -37,6 +37,11 @@ def test_validate_label_rejects_space() -> None:
         validate_label("has space")
 
 
+def test_validate_label_rejects_trailing_newline() -> None:
+    with pytest.raises(ValueError):
+        validate_label("work\n")
+
+
 def test_validate_label_rejects_too_long() -> None:
     with pytest.raises(ValueError, match=str(LABEL_MAX_LENGTH)):
         validate_label("a" * (LABEL_MAX_LENGTH + 1))

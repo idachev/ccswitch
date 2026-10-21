@@ -51,7 +51,7 @@ def validate_label(label: str) -> None:
         raise ValueError("Label must not be empty.")
     if len(label) > LABEL_MAX_LENGTH:
         raise ValueError(f"Label must be at most {LABEL_MAX_LENGTH} characters.")
-    if not LABEL_PATTERN.match(label):
+    if not LABEL_PATTERN.fullmatch(label):
         raise ValueError(
             "Label must start with an alphanumeric character and contain only "
             "letters, digits, '.', '_', or '-'."

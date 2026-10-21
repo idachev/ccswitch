@@ -299,7 +299,7 @@ def test_rename_preserves_login_and_moves_saved_credentials(state, label, with_t
     state.sw.use("renamed")
 
 
-@pytest.mark.parametrize("source,destination", [("missing", "new"), ("a", "b"), ("a", "bad name")])
+@pytest.mark.parametrize("source,destination", [("missing", "new"), ("a", "b"), ("a", "bad name"), ("a", "new\n")])
 def test_rename_rejects_invalid_names_without_mutation(state, source, destination):
     before = dict(state.entries)
     metadata = state.store.path.read_bytes()
